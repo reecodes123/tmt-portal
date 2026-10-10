@@ -1,0 +1,386 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextIndex"]
+  binaryTargets   = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String        @id @default(cuid())
+  email                String        @unique
+  displayName          String        @db.VarChar(120)
+  passwordHash         String        @db.VarChar(255)
+  role                 UserRole      @default(editor)
+  active               Boolean       @default(true)
+  avatarUrl            String?       @db.VarChar(500)
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  /// Incremented whenever credentials or account access are revoked.
+  sessionVersion       Int           @default(0)
+  /// Compared against TermsPage.version to gate dashboard access when the
+  /// Admin/EIC publishes a substantially updated Terms & Conditions. Null
+  /// means "never accepted" — the migration backfills current staff to the
+  /// version live at deploy time so this only fires on a genuinely new one.
+  termsAcceptedVersion Int?
+  /// Delegated article-approval authority, grantable only by an admin
+  /// (Editor-in-Chief) — see permissions.ts's `canApproveArticles()`. Only
+  /// meaningful for role=editor; admins already have full approval authority
+  /// intrinsically via their role, so this is never checked for them. A
+  /// plain boolean rather than a separate permissions table: this system has
+  /// exactly one delegable capability today, and the existing ActivityLog
+  /// already records who granted/revoked it and when, so a dedicated
+  /// grantedBy/grantedAt table would just duplicate that audit trail.
+  canApproveArticles   Boolean       @default(false)
+  accounts             Account[]
+  activityLogs         ActivityLog[]
+  articles             Article[]
+  boardMember          BoardMember?
+  mediaAssets          MediaAsset[]
+  sessions             Session[]
+
+  @@index([role, active])
+  @@map("users")
+}
+
+/// Auth.js session storage (database session strategy).
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// Auth.js account linking table. Present for adapter compatibility even
+/// though we currently only use the Credentials provider.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+/// Single-use tokens for password reset.
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String    @unique @db.VarChar(80)
+  slug        String    @unique @db.VarChar(80)
+  description String?   @db.Text
+  sortOrder   Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  articles    Article[]
+
+  @@map("categories")
+}
+
+model Article {
+  id               String            @id @default(cuid())
+  slug             String            @unique @db.VarChar(220)
+  title            String            @db.VarChar(255)
+  subheadline      String?           @db.VarChar(255)
+  /// No longer collected on create/edit (see createArticleSchema in
+  /// validation.ts) — legacy field, kept nullable rather than dropped so
+  /// existing articles that already have a value keep it. Never required.
+  excerpt          String?           @db.Text
+  content          String            @db.LongText
+  coverImageUrl    String            @db.VarChar(500)
+  contentImageUrls Json?
+  featured         Boolean           @default(false)
+  status           ArticleStatus     @default(draft)
+  publishedAt      DateTime?
+  views            Int               @default(0)
+  likes            Int               @default(0)
+  bookmarks        Int               @default(0)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  categoryId       String
+  /// The dashboard account that created/last edited this row — for internal
+  /// accountability only, completely separate from `articleBy` (the public
+  /// byline). Nullable with ON DELETE SET NULL rather than required+Restrict:
+  /// an account can be permanently deleted without that cascading into (or
+  /// being blocked by) the articles it authored — the article, its content,
+  /// and its public byline all survive untouched; only this internal "which
+  /// account did this" link becomes null. toArticle() already falls back to
+  /// "Author information unavailable" for exactly this case.
+  authorId         String?
+  /// Attribution for the cover/content photos, e.g. "Juan Dela Cruz". Lives on
+  /// the article rather than MediaAsset — coverImageUrl is a denormalized URL,
+  /// not a foreign key to a specific media row, so there's nothing to hang a
+  /// per-asset credit off; this matches how the rest of the article's photo
+  /// metadata already works.
+  photoCredit      String?           @db.VarChar(160)
+  /// The credited writer's byline, e.g. "Airelyn Moreno" or "Juan Dela Cruz
+  /// and Maria Santos" — manually typed by the Editor/EIC when publishing,
+  /// completely independent of `authorId` (the dashboard account that
+  /// created/edited the row, kept for auditing) and of the Editorial Board
+  /// `Position` system. Deliberately plain text, not a foreign key to either
+  /// — the person who wrote a piece is often not the staff account that
+  /// keyed it into the CMS, and doesn't need to hold any Editorial Board
+  /// title at all.
+  articleBy        String            @db.VarChar(160)
+  revisions        ArticleRevision[]
+  author           User?             @relation(fields: [authorId], references: [id])
+  category         Category          @relation(fields: [categoryId], references: [id])
+
+  @@index([status, publishedAt])
+  @@index([categoryId, status])
+  @@index([authorId, updatedAt])
+  @@index([featured, status])
+  @@fulltext([title, excerpt, content])
+  @@map("articles")
+}
+
+/// Version history. A row is written on every save so edits can be reverted —
+/// required by the proposal's content-accuracy constraint.
+model ArticleRevision {
+  id           String        @id @default(cuid())
+  articleId    String
+  title        String        @db.VarChar(255)
+  /// Nullable to match Article.excerpt — a snapshot can only carry what the
+  /// article actually had at that moment.
+  excerpt      String?       @db.Text
+  content      String        @db.LongText
+  status       ArticleStatus
+  editedById   String
+  editedByName String        @db.VarChar(120)
+  createdAt    DateTime      @default(now())
+  article      Article       @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId, createdAt])
+  @@map("article_revisions")
+}
+
+model MediaAsset {
+  id           String   @id @default(cuid())
+  url          String   @db.VarChar(500)
+  fileName     String   @db.VarChar(255)
+  mimeType     String   @db.VarChar(100)
+  sizeBytes    Int
+  createdAt    DateTime @default(now())
+  /// Nullable with ON DELETE SET NULL — same reasoning as Article.authorId:
+  /// deleting the uploader's account must not delete or block deleting the
+  /// uploaded file's metadata (still-embedded images must keep working).
+  uploadedById String?
+  uploadedBy   User?    @relation(fields: [uploadedById], references: [id])
+
+  @@index([uploadedById, createdAt])
+  @@map("media_assets")
+}
+
+/// Admin-manageable catalog of editorial titles — e.g. "Managing Editor",
+/// "Lead Photojournalist". Kept separate from BoardMember so the Admin
+/// picks from a controlled list instead of typing free text (which used to
+/// let "Managing Editor" / "managing editor" / "Managing Editor " coexist
+/// as different values). `tier` here is what actually drives grouping/order
+/// on the org chart; a BoardMember's tier is *derived* from its Position, so
+/// there's exactly one place that says which level a title belongs to.
+model Position {
+  id           String        @id @default(cuid())
+  name         String        @unique @db.VarChar(120)
+  tier         BoardTier
+  /// Order among positions within the same tier (e.g. which section-editor
+  /// title lists first). Independent of BoardMember.sortOrder, which orders
+  /// the *people* on the public chart.
+  sortOrder    Int           @default(0)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  boardMembers BoardMember[]
+
+  @@index([tier, sortOrder])
+  @@map("positions")
+}
+
+model BoardMember {
+  id          String   @id @default(cuid())
+  name        String   @db.VarChar(120)
+  description String?  @db.Text
+  imageUrl    String?  @db.VarChar(500)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  /// Optional link to a login account when the member also has one.
+  userId      String?  @unique
+  positionId  String
+  position    Position @relation(fields: [positionId], references: [id])
+  user        User?    @relation(fields: [userId], references: [id])
+
+  @@index([positionId, sortOrder])
+  @@map("board_members")
+}
+
+model Feedback {
+  id          String         @id @default(cuid())
+  message     String         @db.Text
+  name        String?        @db.VarChar(120)
+  status      FeedbackStatus @default(unread)
+  submittedAt DateTime       @default(now())
+
+  @@index([status, submittedAt])
+  @@map("feedback")
+}
+
+/// Single-row table (id = "main") holding editable site-wide settings.
+model WebsiteSettings {
+  id                      String   @id @default("main")
+  siteName                String   @default("The Matrix Today") @db.VarChar(120)
+  tagline                 String   @default("Engineering Innovations, Journalistic Excellence") @db.VarChar(255)
+  logoUrl                 String?  @db.VarChar(500)
+  heroHeadline            String   @default("The Matrix Today") @db.VarChar(255)
+  heroSubheadline         String   @db.Text
+  announcement            String?  @db.Text
+  organizationName        String   @default("The Matrix Today") @db.VarChar(120)
+  organizationDescription String   @db.Text
+  contactEmail            String   @default("thematrixtoday.msc@gmail.com") @db.VarChar(255)
+  socialFacebook          String   @default("") @db.VarChar(500)
+  socialX                 String   @default("") @db.VarChar(500)
+  socialInstagram         String   @default("") @db.VarChar(500)
+  socialYoutube           String   @default("") @db.VarChar(500)
+  footerText              String   @db.Text
+  updatedAt               DateTime @updatedAt
+  /// e.g. "2026–2027". Free text rather than two int years — masthead
+  /// convention uses an en dash, and nothing downstream parses the range.
+  academicYear            String   @default("2025–2026") @db.VarChar(20)
+
+  @@map("website_settings")
+}
+
+/// Single-row table (id = "main") holding the editable About Us page.
+/// Structured fields only where the current UI is a genuine repeating list
+/// (mission pillars, achievements); everything else is one rich-text block
+/// edited with the same RichTextEditor used for Article.content — not a
+/// generic content-builder.
+model AboutPage {
+  id             String   @id @default("main")
+  heroEyebrow    String?  @db.VarChar(120)
+  heroTitle      String   @db.VarChar(120)
+  heroSubtitle   String?  @db.Text
+  heroImageUrl   String?  @db.VarChar(500)
+  /// Rich HTML — replaces the previously-hardcoded narrative paragraphs.
+  overview       String   @db.LongText
+  /// [{ icon, label, description }] — small, bounded, admin-editable list.
+  /// `icon` is validated server-side against a fixed key vocabulary
+  /// (src/lib/icons.ts), not free text.
+  missionPillars Json
+  /// [{ year, icon, title, description }] — admin can add/edit/remove/reorder.
+  achievements   Json
+  updatedAt      DateTime @updatedAt
+
+  @@map("about_page")
+}
+
+/// Single-row table (id = "main") holding the editable Terms & Conditions
+/// document. `version` is bumped only when the Admin/EIC marks an edit
+/// "substantial", which is what drives re-acceptance prompts for both
+/// anonymous visitors (localStorage) and staff (User.termsAcceptedVersion).
+model TermsPage {
+  id        String   @id @default("main")
+  /// Whole ToS document as rich HTML, edited as one block.
+  content   String   @db.LongText
+  version   Int      @default(1)
+  updatedAt DateTime @updatedAt
+
+  @@map("terms_page")
+}
+
+/// One row per calendar day. Incremented once per browser per day, so it
+/// never stores an identifier for the visitor.
+model DailyVisit {
+  date     DateTime @id @db.Date
+  visitors Int      @default(0)
+
+  @@map("daily_visits")
+}
+
+/// Audit trail of every mutating dashboard action.
+model ActivityLog {
+  id         String   @id @default(cuid())
+  action     String   @db.VarChar(60)
+  targetType String   @db.VarChar(60)
+  targetId   String?  @db.VarChar(60)
+  summary    String   @db.VarChar(500)
+  createdAt  DateTime @default(now())
+  /// Nullable with ON DELETE SET NULL — same reasoning as Article.authorId:
+  /// the audit trail (action, summary, timestamp) is the historical record
+  /// that must survive; only the live link to "which account did this"
+  /// becomes null once that account is deleted. toActivityLog() already
+  /// falls back to "Unknown" for exactly this case.
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("activity_logs")
+}
+
+enum UserRole {
+  reader
+  editor
+  admin
+}
+
+/// draft -> in_review -> published, with a rejection loop:
+/// in_review -> needs_revision -> (editor revises) -> in_review -> published.
+/// The transition into "published" (approval) and into "needs_revision"
+/// (rejection) both require canApproveArticles() — see permissions.ts.
+enum ArticleStatus {
+  draft
+  in_review
+  needs_revision
+  published
+}
+
+enum FeedbackStatus {
+  unread
+  read
+  archived
+}
+
+enum BoardTier {
+  adviser
+  editor_in_chief
+  editorial_leadership
+  section_editor
+  assistant_editor
+  creatives
+  media
+  broadcast
+  technical
+  news_writer
+  feature_writer
+  sports_writer
+  copyreader
+  literary_writer
+  cartoonist
+  photojournalist
+  consultant
+}
